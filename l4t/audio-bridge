@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# audio-bridge — Switch L4T (emisor): manda el audio de la Switch a la PC.
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
+
+usage() {
+  cat <<'EOF'
+audio-bridge (Switch L4T · emisor)
+
+  audio-bridge on [tcp|roc] [--keep-default]   manda el audio a la PC (default: tcp)
+                                               --keep-default: no cambia la salida, mueves apps a mano
+  audio-bridge off                             regresa el audio a la Switch
+  audio-bridge status                          diagnóstico (red, sinks, latencia)
+  audio-bridge click [both|remote] [n]         test de latencia a oído
+  audio-bridge persist tcp|roc                 dejar el sink fijo (reinicia PipeWire)
+  audio-bridge unpersist                       quitar lo fijo
+
+La PC tiene que estar en el mismo modo.
+EOF
+}
+
+sink_for() { case $1 in tcp) echo bridge_pc ;; roc) echo bridge_roc ;; esac; }
+
+tunnel_args() {
+  local a="server=tcp:$PC_IP:$TCP_PORT sink_name=bridge_pc"
+  [[ -n ${TUNNEL_LATENCY_MSEC:-} ]] && a+=" latency_msec=$TUNNEL_LATENCY_MSEC"
+  echo "$a"
+}
+
+roc_block() {
+  cat <<EOF
+  { name = libpipewire-module-roc-sink
+    args = {
+      fec.code           = $ROC_FEC
+      remote.ip          = $PC_IP
+      remote.source.port = $ROC_SOURCE_PORT
+      remote.repair.port = $ROC_REPAIR_PORT
+      sink.name          = "bridge_roc"
+      sink.props         = { node.name = "bridge_roc" node.description = "PC CachyOS (ROC)" }
+    }
+  }
+EOF
+}
+
+move_all_to() {
+  pactl list short sink-inputs | awk '{print $1}' | while read -r si; do
+    pactl move-sink-input "$si" "$1" 2>/dev/null || true
+  done
+}
+
+need_pc_ip() { [[ -n ${PC_IP:-} ]] || die "PC_IP vacío. Corre ./install.sh o edita config.local.env"; }
+
+cmd_on() {
+  local mode=${1:-tcp} keep=0 sink
+  [[ ${2:-} == --keep-default || ${1:-} == --keep-default ]] && keep=1
+  [[ $mode == --keep-default ]] && mode=tcp
+  check_pipewire
+  need_pc_ip
+  guard_on
+  sink=$(sink_for "$mode") || true
+  [[ -n $sink ]] || die "modo inválido: $mode (tcp|roc)"
+
+  pactl get-default-sink >"$STATE_DIR/prev_default_sink"
+  case $mode in
+    tcp)
+      # shellcheck disable=SC2046
+      load_mod module-tunnel-sink $(tunnel_args)
+      ;;
+    roc)
+      require_roc
+      pw_standalone_conf "$(roc_block)" >"$STATE_DIR/roc.conf"
+      spawn_pw "$STATE_DIR/roc.conf"
+      ;;
+  esac
+  echo "$mode" >"$STATE_DIR/bridge.mode"
+
+  if ! wait_sink "$sink" 8; then
+    warn "el sink '$sink' no apareció en 8s"
+    [[ $mode == tcp ]] && warn "¿PC en 'audio-bridge on tcp'? ¿firewall? revisa: audio-bridge status"
+    cmd_off
+    exit 1
+  fi
+
+  if ((keep)); then
+    log "sink '$sink' listo. Manda apps ahí desde el applet de volumen de KDE"
+  else
+    pactl set-default-sink "$sink"
+    move_all_to "$sink"
+    log "salida = $sink. Todo el audio de la Switch va a la PC"
+  fi
+}
+
+cmd_off() {
+  local prev=""
+  [[ -f $STATE_DIR/prev_default_sink ]] && prev=$(<"$STATE_DIR/prev_default_sink")
+  stop_bridge
+  if [[ -n $prev ]] && sink_exists "$prev"; then
+    pactl set-default-sink "$prev"
+    move_all_to "$prev"
+    log "salida restaurada: $prev"
+  fi
+  rm -f "$STATE_DIR/prev_default_sink"
+  log "emisor apagado"
+}
+
+cmd_status() {
+  set +e
+  hr "Servidor de audio"
+  pactl info | grep -E '^(Server Name|Default Sink)'
+  hr "Bridge"
+  if is_active; then echo "estado: ACTIVO ($(active_mode))"; else echo "estado: apagado"; fi
+  show_persisted
+  if roc_available; then echo "módulos ROC: sí"; else echo "módulos ROC: no (ver ./install.sh)"; fi
+  hr "Sinks"
+  pactl list short sinks
+  hr "Latencia del sink del bridge"
+  pactl list sinks | awk '/^\s*Name: bridge_/{p=1} p&&/Latency/{print; p=0}'
+  hr "Red hacia PC_IP=${PC_IP:-<vacío>}"
+  if [[ -n ${PC_IP:-} ]]; then
+    ping -c 5 -i 0.2 "$PC_IP" | tail -2
+    if timeout 2 bash -c "echo > /dev/tcp/$PC_IP/$TCP_PORT" 2>/dev/null; then
+      echo "TCP $TCP_PORT: abierto"
+    else
+      echo "TCP $TCP_PORT: cerrado/filtrado (normal si la PC está en modo roc)"
+    fi
+  fi
+  hr "Wi-Fi"
+  iw dev 2>/dev/null | grep -E 'ssid|channel' || nmcli -f IN-USE,SSID,CHAN,FREQ,SIGNAL dev wifi 2>/dev/null | grep '^\*'
+}
+
+cmd_click() {
+  local where=${1:-both} n=${2:-10} wav="$STATE_DIR/click.wav" remote local_sink i
+  need pw-play
+  need python3
+  if [[ ! -f $wav ]]; then
+    python3 - "$wav" <<'PY'
+import math, struct, sys, wave
+rate = 48000
+frames = b"".join(
+    struct.pack("<h", int(32000 * math.sin(2 * math.pi * 2000 * i / rate) * (1 - i / 480)))
+    for i in range(480)  # 10 ms, 2 kHz con decay
+) + b"\x00\x00" * (rate - 480)
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(frames)
+PY
+  fi
+  remote=$(list_sinks | grep -E '^bridge_(pc|roc)$' | head -1 || true)
+  [[ -n $remote ]] || die "no hay sink del bridge. Corre: audio-bridge on"
+  local_sink=$(cat "$STATE_DIR/prev_default_sink" 2>/dev/null || true)
+  [[ $where == remote || -n $local_sink ]] || die "no sé cuál es la bocina local; usa: audio-bridge click remote"
+  log "remoto=$remote local=${local_sink:-n/a}  ($n clicks, 1 por segundo)"
+  log "con 'both': la diferencia entre bocina de la Switch y audífonos = latencia"
+  for ((i = 1; i <= n; i++)); do
+    pw-play --target "$remote" "$wav" &
+    [[ $where == both ]] && pw-play --target "$local_sink" "$wav" &
+    sleep 1
+  done
+  wait
+}
+
+cmd_persist() {
+  local mode=${1:-}
+  check_pipewire
+  need_pc_ip
+  is_active && die "apaga primero el modo temporal: audio-bridge off"
+  is_persisted && die "ya hay algo persistido. Primero: audio-bridge unpersist"
+  case $mode in
+    tcp)
+      mkdir -p "$(dirname "$PERSIST_PULSE")"
+      cat >"$PERSIST_PULSE" <<EOF
+# generado por audio-bridge persist tcp
+pulse.cmd = [
+  { cmd = "load-module" args = "module-tunnel-sink $(tunnel_args)" flags = [ nofail ] }
+]
+EOF
+      log "escrito $PERSIST_PULSE"
+      ;;
+    roc)
+      require_roc
+      mkdir -p "$(dirname "$PERSIST_PW")"
+      { echo "# generado por audio-bridge persist roc"; echo "context.modules = ["; roc_block; echo "]"; } >"$PERSIST_PW"
+      log "escrito $PERSIST_PW"
+      ;;
+    *) die "uso: audio-bridge persist tcp|roc" ;;
+  esac
+  restart_pipewire
+  log "el sink '$(sink_for "$mode")' se crea solo. Elígelo como salida en KDE (se recuerda)"
+}
+
+case ${1:-} in
+  on) shift; cmd_on "$@" ;;
+  off) need pactl; cmd_off ;;
+  status) cmd_status ;;
+  click) shift; cmd_click "$@" ;;
+  persist) shift; cmd_persist "$@" ;;
+  unpersist) unpersist ;;
+  *) usage ;;
+esac

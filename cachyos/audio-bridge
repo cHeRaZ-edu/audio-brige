@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# audio-bridge — CachyOS (receptor): recibe el audio de la Switch y lo mezcla en tu salida.
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
+
+usage() {
+  cat <<'EOF'
+audio-bridge (CachyOS · receptor)
+
+  audio-bridge on [tcp|roc]      empieza a recibir (default: tcp)
+  audio-bridge off               deja de recibir
+  audio-bridge status            diagnóstico
+  audio-bridge persist tcp|roc   dejarlo fijo al iniciar sesión (reinicia PipeWire)
+  audio-bridge unpersist         quitar lo fijo
+
+La Switch tiene que usar el mismo modo.
+EOF
+}
+
+tcp_args() { echo "port=$TCP_PORT auth-ip-acl=127.0.0.1;$LAN_SUBNET auth-anonymous=1"; }
+
+roc_block() {
+  cat <<EOF
+  { name = libpipewire-module-roc-source
+    args = {
+      fec.code           = $ROC_FEC
+      local.ip           = 0.0.0.0
+      local.source.port  = $ROC_SOURCE_PORT
+      local.repair.port  = $ROC_REPAIR_PORT
+      sess.latency.msec  = $ROC_LATENCY_MSEC
+      resampler.profile  = medium
+      source.name        = "bridge_roc_recv"
+      source.props       = { node.name = "bridge_roc_recv" node.description = "Switch (ROC)" }
+    }
+  }
+EOF
+}
+
+fw_hint() {
+  local ports=$1 proto=$2
+  if command -v ufw >/dev/null 2>&1; then
+    warn "si usas ufw: sudo ufw allow from $LAN_SUBNET to any port $ports proto $proto"
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    warn "si usas firewalld: sudo firewall-cmd --add-port=${ports/:/-}/$proto"
+  fi
+}
+
+cmd_on() {
+  local mode=${1:-tcp}
+  check_pipewire
+  guard_on
+  case $mode in
+    tcp)
+      # shellcheck disable=SC2046
+      load_mod module-native-protocol-tcp $(tcp_args)
+      log "escuchando TCP $TCP_PORT para $LAN_SUBNET"
+      fw_hint "$TCP_PORT" tcp
+      ;;
+    roc)
+      require_roc
+      pw_standalone_conf "$(roc_block)" >"$STATE_DIR/roc.conf"
+      spawn_pw "$STATE_DIR/roc.conf"
+      log "ROC escuchando UDP $ROC_SOURCE_PORT/$ROC_REPAIR_PORT, buffer ${ROC_LATENCY_MSEC}ms, fec=$ROC_FEC"
+      log "aparecerá 'Switch (ROC)' como stream de reproducción cuando la Switch mande audio"
+      fw_hint "$ROC_SOURCE_PORT:$ROC_REPAIR_PORT" udp
+      ;;
+    *) die "modo inválido: $mode (tcp|roc)" ;;
+  esac
+  echo "$mode" >"$STATE_DIR/bridge.mode"
+}
+
+cmd_status() {
+  set +e
+  hr "Servidor de audio"
+  pactl info | grep -E '^(Server Name|Default Sink)'
+  hr "Bridge"
+  if is_active; then echo "estado: ACTIVO ($(active_mode))"; else echo "estado: apagado"; fi
+  show_persisted
+  if roc_available; then echo "módulos ROC: sí"; else echo "módulos ROC: no (sudo pacman -S pipewire-roc)"; fi
+  hr "IP de esta PC (va en PC_IP de la Switch)"
+  ip -o -4 addr show scope global | awk '{print $2": "$4}'
+  hr "Puertos escuchando"
+  ss -ltnu | grep -E ":($TCP_PORT|$ROC_SOURCE_PORT|$ROC_REPAIR_PORT)\b" || echo "(nada en $TCP_PORT/tcp ni $ROC_SOURCE_PORT-$ROC_REPAIR_PORT/udp)"
+  hr "Streams entrantes"
+  pactl list sink-inputs 2>/dev/null | grep -E 'application.name|node.description|media.name' | grep -iE 'tunnel|roc|switch|edu-switch' ||
+    echo "(ninguno; manda audio desde la Switch)"
+}
+
+cmd_persist() {
+  local mode=${1:-}
+  check_pipewire
+  is_active && die "apaga primero el modo temporal: audio-bridge off"
+  is_persisted && die "ya hay algo persistido. Primero: audio-bridge unpersist"
+  case $mode in
+    tcp)
+      mkdir -p "$(dirname "$PERSIST_PULSE")"
+      cat >"$PERSIST_PULSE" <<EOF
+# generado por audio-bridge persist tcp
+pulse.cmd = [
+  { cmd = "load-module" args = "module-native-protocol-tcp $(tcp_args)" flags = [ nofail ] }
+]
+EOF
+      log "escrito $PERSIST_PULSE"
+      ;;
+    roc)
+      require_roc
+      mkdir -p "$(dirname "$PERSIST_PW")"
+      { echo "# generado por audio-bridge persist roc"; echo "context.modules = ["; roc_block; echo "]"; } >"$PERSIST_PW"
+      log "escrito $PERSIST_PW"
+      ;;
+    *) die "uso: audio-bridge persist tcp|roc" ;;
+  esac
+  restart_pipewire
+  log "listo, se carga solo en cada inicio de sesión"
+}
+
+case ${1:-} in
+  on) shift; cmd_on "$@" ;;
+  off) need pactl; stop_bridge; log "receptor apagado" ;;
+  status) cmd_status ;;
+  persist) shift; cmd_persist "$@" ;;
+  unpersist) unpersist ;;
+  *) usage ;;
+esac
